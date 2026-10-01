@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+venv/
+.env
+.git/
+.vscode/
+uploads/
+output/
+*.pdf
+*.xlsx
+*.xls
+*.xlsm
