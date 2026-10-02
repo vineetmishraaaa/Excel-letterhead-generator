@@ -1,4 +1,5 @@
 import os
+from flask import send_from_directory
 import shutil
 import subprocess
 import tempfile
@@ -15,6 +16,9 @@ from werkzeug.utils import secure_filename
 
 
 app = Flask(__name__)
+@app.route("/google4b98075054d1ec81.html")
+def google_verification():
+    return send_from_directory(".", "google4b98075054d1ec81.html")
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024
 
 BASE_DIR = Path(__file__).resolve().parent
