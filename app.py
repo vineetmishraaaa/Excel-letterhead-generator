@@ -1,168 +1,237 @@
 import os
+import shutil
 import subprocess
 import tempfile
 from io import BytesIO
 from pathlib import Path
 from threading import Lock
+from urllib.parse import quote
 
 import fitz
-from PIL import Image, ImageOps
 from flask import Flask, jsonify, render_template, request, send_file
+from openpyxl import load_workbook
+from openpyxl.styles.numbers import is_date_format
 from werkzeug.utils import secure_filename
 
 
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024
 
 BASE_DIR = Path(__file__).resolve().parent
-UPLOAD_FOLDER = BASE_DIR / 'uploads'
-OUTPUT_FOLDER = BASE_DIR / 'output'
-
+UPLOAD_FOLDER = BASE_DIR / "uploads"
+OUTPUT_FOLDER = BASE_DIR / "output"
 UPLOAD_FOLDER.mkdir(exist_ok=True)
 OUTPUT_FOLDER.mkdir(exist_ok=True)
 
-app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024
+ALLOWED_EXCEL = {".xlsx", ".xlsm"}
+ALLOWED_LETTERHEAD = {".pdf"}
 
-ALLOWED_EXCEL = {'.xlsx', '.xls', '.xlsm'}
-ALLOWED_LETTERHEAD = {'.pdf'}
+# One conversion at a time keeps the free 512 MB instance stable.
+CONVERSION_LOCK = Lock()
 
 LETTERHEAD_PAGE = 0
 A4_WIDTH_CM = 21.0
 A4_HEIGHT_CM = 29.7
-CONTENT_TOP_CM = 4.15
-CONTENT_WIDTH_CM = 19.60
-CONTENT_BOTTOM_MARGIN_CM = 0.70
-CONTENT_GAP_CM = 0.20
 
-# LibreOffice/Calc should only be driven by one request at a time.
-CONVERSION_LOCK = Lock()
-
-
-def cm_to_pt(cm):
-    return cm * 72.0 / 2.54
+# Tuned from the proven local workflow/reference PDF.
+CONTENT_X_PT = 25.65
+CONTENT_TOP_PT = 127.0
+CONTENT_WIDTH_PT = 545.5
+CONTENT_HEIGHT_PT = 345.0
 
 
-def get_non_white_bbox(pdf_page):
-    pix = pdf_page.get_pixmap(
-        matrix=fitz.Matrix(2.0, 2.0),
-        colorspace=fitz.csRGB,
-        alpha=False,
-    )
+# ============================================================
+# WORKBOOK PREPARATION
+# ============================================================
 
-    image = Image.frombytes(
-        'RGB',
-        [pix.width, pix.height],
-        pix.samples,
-    )
+def prepare_workbook(src: Path, dst: Path) -> None:
+    """Prepare a temporary workbook copy for Calc PDF export.
 
-    gray = ImageOps.grayscale(image)
+    The original upload is never changed.
+    """
+    keep_vba = src.suffix.lower() == ".xlsm"
+    wb = load_workbook(src, keep_vba=keep_vba)
 
-    mask = gray.point(
-        lambda value: 255 if value < 245 else 0
-    )
+    for ws in wb.worksheets:
+        if ws.sheet_state != "visible":
+            continue
 
-    bbox = mask.getbbox()
+        setup = ws.page_setup
 
-    if bbox is None:
-        return pdf_page.rect
+        # A4 portrait, matching the working desktop version.
+        setup.paperSize = ws.PAPERSIZE_A4
+        setup.orientation = ws.ORIENTATION_PORTRAIT
 
-    left, top, right, bottom = bbox
-    padding_px = 6
+        # Critical: keep each worksheet on one printed page.
+        setup.fitToWidth = 1
+        setup.fitToHeight = 1
+        ws.sheet_properties.pageSetUpPr.fitToPage = True
 
-    left = max(0, left - padding_px)
-    top = max(0, top - padding_px)
-    right = min(pix.width, right + padding_px)
-    bottom = min(pix.height, bottom + padding_px)
+        # These only affect the temporary copy.
+        setup.leftMargin = 0.20
+        setup.rightMargin = 0.20
+        setup.topMargin = 0.15
+        setup.bottomMargin = 0.20
+        ws.print_options.gridLines = False
 
-    sx = pdf_page.rect.width / pix.width
-    sy = pdf_page.rect.height / pix.height
+        # Letterhead is supplied separately.
+        setup.leftHeader = ""
+        setup.centerHeader = ""
+        setup.rightHeader = ""
+        setup.leftFooter = ""
+        setup.centerFooter = ""
+        setup.rightFooter = ""
 
-    return fitz.Rect(
-        left * sx,
-        top * sy,
-        right * sx,
-        bottom * sy,
-    )
+        # Preserve an existing print area; otherwise use used range.
+        if not ws.print_area:
+            ws.print_area = ws.calculate_dimension()
 
+        # Excel/LibreOffice can display date formats differently.
+        # Normalize real date-formatted cells to the expected format.
+        for row in ws.iter_rows():
+            for cell in row:
+                if cell.value is not None and is_date_format(cell.number_format):
+                    cell.number_format = "dd-mm-yyyy"
 
-def calculate_destination_rect(page, source_rect):
-    page_width = page.rect.width
-    page_height = page.rect.height
-
-    max_width = cm_to_pt(CONTENT_WIDTH_CM)
-    top = cm_to_pt(CONTENT_TOP_CM + CONTENT_GAP_CM)
-    bottom_margin = cm_to_pt(CONTENT_BOTTOM_MARGIN_CM)
-    max_height = page_height - top - bottom_margin
-
-    if source_rect.width <= 0 or source_rect.height <= 0:
-        raise ValueError('Excel PDF page contains no usable content.')
-
-    width_scale = max_width / source_rect.width
-    height_scale = max_height / source_rect.height
-    scale = min(width_scale, height_scale)
-
-    dest_width = source_rect.width * scale
-    dest_height = source_rect.height * scale
-
-    x = (page_width - dest_width) / 2.0
-    y = top
-
-    return fitz.Rect(
-        x,
-        y,
-        x + dest_width,
-        y + dest_height,
-    )
+    wb.save(dst)
 
 
-def export_excel_to_pdf(excel_path, output_pdf):
-    helper = BASE_DIR / 'libreoffice_export.py'
+def export_excel_to_pdf(src: Path, pdf_out: Path) -> None:
+    """Convert the complete workbook with one-shot headless LibreOffice.
 
-    result = subprocess.run(
-        [
-            '/usr/bin/python3',
-            '-S',
-            str(helper),
-            str(excel_path),
-            str(output_pdf),
-        ],
-        capture_output=True,
-        text=True,
-        timeout=240,
-    )
+    This avoids the long-running UNO bridge that caused the original
+    Render memory problem. The temporary workbook is deleted afterwards.
+    """
+    temp_dir = Path(tempfile.mkdtemp(prefix="excelpdf_"))
+    prepared = temp_dir / "prepared.xlsx"
+    profile = temp_dir / "lo_profile"
 
-    if result.returncode != 0:
-        details = result.stderr.strip() or result.stdout.strip()
-        raise RuntimeError(
-            details or 'Excel to PDF conversion failed.'
+    try:
+        prepare_workbook(src, prepared)
+        profile.mkdir(exist_ok=True)
+
+        profile_url = "file://" + quote(
+            str(profile.resolve()).replace("\\", "/"),
+            safe="/:"
         )
 
-    if not output_pdf.exists():
-        raise RuntimeError('Excel to PDF conversion produced no file.')
+        env = os.environ.copy()
+        env["HOME"] = "/tmp"
+        env["SAL_USE_VCLPLUGIN"] = "svp"
+        env["SAL_DISABLE_OPENCL"] = "1"
+        env["MALLOC_TRIM_THRESHOLD_"] = "65536"
+
+        cmd = [
+            "libreoffice",
+            "--headless",
+            "--nologo",
+            "--nodefault",
+            "--nofirststartwizard",
+            "--norestore",
+            "--nolockcheck",
+            f"-env:UserInstallation={profile_url}",
+            "--convert-to",
+            "pdf:calc_pdf_Export",
+            "--outdir",
+            str(temp_dir.resolve()),
+            str(prepared.resolve()),
+        ]
+
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=180,
+            env=env,
+        )
+
+        generated = prepared.with_suffix(".pdf")
+
+        if result.returncode != 0 or not generated.exists():
+            details = (result.stderr or result.stdout).strip()
+            raise RuntimeError(
+                details or "Excel to PDF conversion failed."
+            )
+
+        if pdf_out.exists():
+            pdf_out.unlink()
+
+        shutil.move(str(generated), str(pdf_out))
+
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 
-def create_final_pdf(letterhead_pdf, excel_pdf, final_pdf):
+# ============================================================
+# PDF PLACEMENT
+# ============================================================
+
+def visible_content_bbox(page: fitz.Page) -> fitz.Rect:
+    """Find Excel's visible vector content without rasterization."""
+    rects = []
+
+    for block in page.get_text("blocks"):
+        if len(block) >= 4:
+            rects.append(
+                fitz.Rect(block[0], block[1], block[2], block[3])
+            )
+
+    for drawing in page.get_drawings():
+        rect = drawing.get("rect")
+        if rect:
+            rects.append(rect)
+
+    for image in page.get_images(full=True):
+        try:
+            rects.extend(page.get_image_rects(image[0]))
+        except Exception:
+            pass
+
+    if not rects:
+        return page.rect
+
+    bbox = rects[0]
+    for rect in rects[1:]:
+        bbox |= rect
+
+    padding = 3
+
+    return fitz.Rect(
+        max(page.rect.x0, bbox.x0 - padding),
+        max(page.rect.y0, bbox.y0 - padding),
+        min(page.rect.x1, bbox.x1 + padding),
+        min(page.rect.y1, bbox.y1 + padding),
+    )
+
+
+def create_final_pdf(
+    letterhead_pdf: Path,
+    excel_pdf: Path,
+    final_pdf: Path,
+) -> int:
+    """Apply the clean letterhead to every Excel PDF page."""
     letterhead_doc = fitz.open(str(letterhead_pdf))
     excel_doc = fitz.open(str(excel_pdf))
     output_doc = fitz.open()
 
     try:
         if len(letterhead_doc) <= LETTERHEAD_PAGE:
-            raise ValueError('Letterhead PDF does not contain a first page.')
-
-        if len(excel_doc) == 0:
-            raise ValueError('Excel exported PDF contains no pages.')
-
-        template_page = letterhead_doc[LETTERHEAD_PAGE]
-
-        for page_number in range(len(excel_doc)):
-            excel_page = excel_doc[page_number]
-            crop_rect = get_non_white_bbox(excel_page)
-
-            page = output_doc.new_page(
-                width=cm_to_pt(A4_WIDTH_CM),
-                height=cm_to_pt(A4_HEIGHT_CM),
+            raise ValueError(
+                "Letterhead PDF must contain a first-page template."
             )
 
+        if not excel_doc:
+            raise ValueError(
+                "Excel conversion produced no PDF pages."
+            )
+
+        for page_number, excel_page in enumerate(excel_doc):
+            page = output_doc.new_page(
+                width=A4_WIDTH_CM * 72 / 2.54,
+                height=A4_HEIGHT_CM * 72 / 2.54,
+            )
+
+            # Full clean letterhead background.
             page.show_pdf_page(
                 page.rect,
                 letterhead_doc,
@@ -170,17 +239,28 @@ def create_final_pdf(letterhead_pdf, excel_pdf, final_pdf):
                 keep_proportion=False,
             )
 
-            destination = calculate_destination_rect(
-                page,
-                crop_rect,
+            # Find the worksheet content without creating a bitmap.
+            crop = visible_content_bbox(excel_page)
+
+            # Fixed body box is intentional. It matches the proven local
+            # output much more closely than proportional scaling of Calc's
+            # slightly different page geometry.
+            destination = fitz.Rect(
+                CONTENT_X_PT,
+                CONTENT_TOP_PT,
+                CONTENT_X_PT + CONTENT_WIDTH_PT,
+                CONTENT_TOP_PT + CONTENT_HEIGHT_PT,
             )
 
+            # We allow non-uniform scaling because the source renderer
+            # (Calc) and desktop Excel produce slightly different page
+            # geometry. The actual worksheet remains vector PDF content.
             page.show_pdf_page(
                 destination,
                 excel_doc,
                 page_number,
-                keep_proportion=True,
-                clip=crop_rect,
+                keep_proportion=False,
+                clip=crop,
             )
 
         output_doc.save(
@@ -190,65 +270,83 @@ def create_final_pdf(letterhead_pdf, excel_pdf, final_pdf):
             clean=True,
         )
 
+        return len(excel_doc)
+
     finally:
         output_doc.close()
         excel_doc.close()
         letterhead_doc.close()
 
 
-def extension_ok(name, allowed):
-    return Path(name).suffix.lower() in allowed
+# ============================================================
+# WEB ROUTES
+# ============================================================
 
-
-@app.get('/')
+@app.get("/")
 def index():
-    return render_template('index.html')
+    return render_template("index.html")
 
 
-@app.get('/health')
+@app.get("/health")
 def health():
-    return jsonify({'status': 'ok'})
+    return jsonify({"status": "ok"})
 
 
-@app.post('/upload')
+@app.post("/upload")
 def upload():
-    excel_file = request.files.get('excel_file')
-    letterhead_file = request.files.get('letterhead')
+    excel_file = request.files.get("excel_file")
+    letterhead_file = request.files.get("letterhead")
 
     if not excel_file or not letterhead_file:
-        return jsonify({'error': 'Please select both files.'}), 400
+        return jsonify({
+            "error": "Please select both files."
+        }), 400
 
     if not excel_file.filename or not letterhead_file.filename:
-        return jsonify({'error': 'Please select both files.'}), 400
+        return jsonify({
+            "error": "Please select both files."
+        }), 400
 
     excel_name = secure_filename(excel_file.filename)
     letterhead_name = secure_filename(letterhead_file.filename)
 
-    if not extension_ok(excel_name, ALLOWED_EXCEL):
-        return jsonify({'error': 'Please upload an Excel file (.xlsx, .xls or .xlsm).'}), 400
+    if Path(excel_name).suffix.lower() not in ALLOWED_EXCEL:
+        return jsonify({
+            "error": "Please upload an .xlsx or .xlsm file."
+        }), 400
 
-    if not extension_ok(letterhead_name, ALLOWED_LETTERHEAD):
-        return jsonify({'error': 'Please upload a PDF letterhead.'}), 400
+    if Path(letterhead_name).suffix.lower() not in ALLOWED_LETTERHEAD:
+        return jsonify({
+            "error": "Please upload a PDF letterhead."
+        }), 400
 
+    # Serialize conversions to keep RAM predictable on free hosting.
     with CONVERSION_LOCK:
-        with tempfile.TemporaryDirectory(prefix='excel_letterhead_') as temp_dir:
-            temp_dir = Path(temp_dir)
+        with tempfile.TemporaryDirectory(
+            prefix="request_"
+        ) as request_dir:
 
-            excel_path = temp_dir / excel_name
-            letterhead_path = temp_dir / letterhead_name
-            excel_pdf = temp_dir / 'excel_export.pdf'
-            final_pdf = temp_dir / 'final_letterhead.pdf'
+            request_dir = Path(request_dir)
+
+            excel_path = request_dir / excel_name
+            letterhead_path = request_dir / letterhead_name
+            excel_pdf = request_dir / "excel_export.pdf"
+            final_pdf = request_dir / "final_letterhead.pdf"
 
             excel_file.save(excel_path)
             letterhead_file.save(letterhead_path)
 
             try:
+                app.logger.info("Starting Excel conversion")
+
                 export_excel_to_pdf(
                     excel_path,
                     excel_pdf,
                 )
 
-                create_final_pdf(
+                app.logger.info("Starting letterhead merge")
+
+                page_count = create_final_pdf(
                     letterhead_path,
                     excel_pdf,
                     final_pdf,
@@ -256,29 +354,36 @@ def upload():
 
                 pdf_bytes = final_pdf.read_bytes()
 
+                app.logger.info(
+                    "Generated %s page(s)",
+                    page_count,
+                )
+
             except Exception as exc:
-                app.logger.exception('PDF generation failed')
+                app.logger.exception(
+                    "PDF generation failed"
+                )
+
                 return jsonify({
-                    'error': str(exc),
+                    "error": str(exc)
                 }), 500
 
     download_name = (
         Path(excel_name).stem
-        + '_WITH_LETTERHEAD.pdf'
+        + "_WITH_LETTERHEAD.pdf"
     )
 
     return send_file(
         BytesIO(pdf_bytes),
         as_attachment=True,
         download_name=download_name,
-        mimetype='application/pdf',
+        mimetype="application/pdf",
     )
 
 
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', '5000'))
+if __name__ == "__main__":
     app.run(
-        host='0.0.0.0',
-        port=port,
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", "5000")),
         debug=False,
     )
